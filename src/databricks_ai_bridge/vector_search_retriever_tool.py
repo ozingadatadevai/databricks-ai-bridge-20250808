@@ -143,16 +143,20 @@ class VectorSearchRetrieverToolMixin(BaseModel):
             return description
 
     def _get_resources(
-        self, index_name: str, embedding_endpoint: str, index_details: IndexDetails
+        self, index_name: str, embedding_endpoint: str, index_details: IndexDetails = None
     ) -> List[Resource]:
         resources = []
         if index_name:
             resources.append(DatabricksVectorSearchIndex(index_name=index_name))
         if embedding_endpoint:
             resources.append(DatabricksServingEndpoint(endpoint_name=embedding_endpoint))
-        if index_details.is_databricks_managed_embeddings and (
-            managed_embedding := index_details.embedding_source_column.get(
-                "embedding_model_endpoint_name", None
+        if (
+            index_details
+            and index_details.is_databricks_managed_embeddings
+            and (
+                managed_embedding := index_details.embedding_source_column.get(
+                    "embedding_model_endpoint_name", None
+                )
             )
         ):
             if managed_embedding != embedding_endpoint:
