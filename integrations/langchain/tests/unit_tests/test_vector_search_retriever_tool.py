@@ -18,6 +18,7 @@ from databricks_ai_bridge.test_utils.vector_search import (  # noqa: F401
     mock_vs_client,
     mock_workspace_client,
 )
+from databricks_ai_bridge.vector_search_retriever_tool import FilterItem
 from langchain_core.embeddings import Embeddings
 from langchain_core.tools import BaseTool
 from mlflow.entities import SpanType
@@ -79,6 +80,7 @@ def init_vector_search_tool(
 def test_init(index_name: str) -> None:
     vector_search_tool = init_vector_search_tool(index_name)
     assert isinstance(vector_search_tool, BaseTool)
+    assert "'additionalProperties': true" not in str(vector_search_tool.args)
 
 
 @pytest.mark.parametrize("index_name", ALL_INDEX_NAMES)
@@ -96,7 +98,10 @@ def test_filters_are_passed_through() -> None:
     vector_search_tool._vector_store.similarity_search = MagicMock()
 
     vector_search_tool.invoke(
-        {"query": "what cities are in Germany", "filters": {"country": "Germany"}}
+        {
+            "query": "what cities are in Germany",
+            "filters": [FilterItem(key="country", value="Germany")],
+        }
     )
     vector_search_tool._vector_store.similarity_search.assert_called_once_with(
         query="what cities are in Germany",
@@ -111,7 +116,10 @@ def test_filters_are_combined() -> None:
     vector_search_tool._vector_store.similarity_search = MagicMock()
 
     vector_search_tool.invoke(
-        {"query": "what cities are in Germany", "filters": {"country": "Germany"}}
+        {
+            "query": "what cities are in Germany",
+            "filters": [FilterItem(key="country", value="Germany")],
+        }
     )
     vector_search_tool._vector_store.similarity_search.assert_called_once_with(
         query="what cities are in Germany",

@@ -1,7 +1,8 @@
-from typing import Any, Dict, Optional, Type
+from typing import List, Optional, Type
 
 from databricks_ai_bridge.utils.vector_search import IndexDetails
 from databricks_ai_bridge.vector_search_retriever_tool import (
+    FilterItem,
     VectorSearchRetrieverToolInput,
     VectorSearchRetrieverToolMixin,
     vector_search_retriever_tool_trace,
@@ -65,9 +66,11 @@ class VectorSearchRetrieverTool(BaseTool, VectorSearchRetrieverToolMixin):
         return self
 
     @vector_search_retriever_tool_trace
-    def _run(self, query: str, filters: Optional[Dict[str, Any]] = None, **kwargs) -> str:
+    def _run(self, query: str, filters: Optional[List[FilterItem]] = None, **kwargs) -> str:
         kwargs = {**kwargs, **(self.model_extra or {})}
-        combined_filters = {**(filters or {}), **(self.filters or {})}
+        # Since LLM can generate either a dict or FilterItem, convert to dict always
+        filters_dict = {dict(item)["key"]: dict(item)["value"] for item in (filters or [])}
+        combined_filters = {**filters_dict, **(self.filters or {})}
         # Ensure that we don't have duplicate keys
         kwargs.update(
             {
