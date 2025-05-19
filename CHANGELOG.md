@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## databricks-ai-bridge 0.5.1, databricks-langchain 0.5.1, databricks-openai 0.4.1 (2025-05-19)
+### Bug Fixes
+- Fix Databricks Vector Search Filter implementation
+- Improve performance for Genie Truncation
+- Fix Bug for Genie Description
+- Deprecate python 3.9 as a supported environment
+
 ## databricks-ai-bridge 0.5.0, databricks-langchain 0.5.0, databricks-openai 0.4.0 (2025-05-12)
 
 ### Improvements
