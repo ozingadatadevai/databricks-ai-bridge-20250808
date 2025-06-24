@@ -69,7 +69,13 @@ class RetrieverSchema:
     other_columns: Optional[List[str]] = None
 
 
-def get_metadata(columns: List[str], result: List[Any], retriever_schema, ignore_cols):
+def get_metadata(
+    columns: List[str],
+    result: List[Any],
+    retriever_schema: RetrieverSchema,
+    ignore_cols: List[str],
+    include_score: bool,
+):
     """
     This function constructs a metadata dictionary by mapping column names to their corresponding values
     from the result row, with special handling for the provided retriever schema.
@@ -88,9 +94,10 @@ def get_metadata(columns: List[str], result: List[Any], retriever_schema, ignore
     metadata = {}
 
     if retriever_schema:
-        # Skipping the last column, which is always the score
-        for col, value in zip(columns[:-1], result[:-1]):
-            if col == retriever_schema.doc_uri:
+        for col, value in zip(columns, result):
+            if col == "score" and include_score:
+                metadata["score"] = value
+            elif col == retriever_schema.doc_uri:
                 metadata["doc_uri"] = value
             elif col == retriever_schema.primary_key:
                 metadata["chunk_id"] = value
@@ -109,7 +116,7 @@ def get_metadata(columns: List[str], result: List[Any], retriever_schema, ignore
             else:
                 metadata[col] = value
     else:
-        for col, value in zip(columns[:-1], result[:-1]):
+        for col, value in zip(columns, result):
             if col not in ignore_cols:
                 metadata[col] = value
     return metadata
@@ -123,6 +130,7 @@ def parse_vector_search_response(
     retriever_schema: RetrieverSchema = None,
     ignore_cols: Optional[List[str]] = None,
     document_class: Any = dict,
+    include_score: bool = False,
 ) -> List[Tuple[Dict, float]]:
     """
     Parse the search response into a list of Documents with score.
@@ -131,9 +139,13 @@ def parse_vector_search_response(
     if ignore_cols is None:
         ignore_cols = []
 
+    if not include_score:
+        ignore_cols.append("score")
+
     if retriever_schema:
         text_column = retriever_schema.text_column
-    ignore_cols.extend([text_column])
+
+    ignore_cols.append(text_column)
 
     columns = [col["name"] for col in search_resp.get("manifest", dict()).get("columns", [])]
     docs_with_score = []
@@ -141,7 +153,7 @@ def parse_vector_search_response(
     for result in search_resp.get("result", dict()).get("data_array", []):
         page_content = result[columns.index(text_column)]
 
-        metadata = get_metadata(columns, result, retriever_schema, ignore_cols)
+        metadata = get_metadata(columns, result, retriever_schema, ignore_cols, include_score)
 
         score = result[-1]
         doc = document_class(page_content=page_content, metadata=metadata)
