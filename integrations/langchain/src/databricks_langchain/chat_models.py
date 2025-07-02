@@ -74,6 +74,13 @@ class ChatDatabricks(BaseChatModel):
                 max_tokens=500,
             )
 
+    For Responses API endpoints like a ResponsesAgent, set ``use_responses_api=True``:
+        .. code-block:: python
+            llm = ChatDatabricks(
+                model="my-responses-agent-endpoint",
+                use_responses_api=True,
+            )
+
     **Invoke**:
 
         .. code-block:: python
@@ -228,6 +235,8 @@ class ChatDatabricks(BaseChatModel):
     """
     stream_usage: bool = False
     """Any extra parameters to pass to the endpoint."""
+    use_responses_api: bool = False
+    """Whether to use the Responses API to format inputs and outputs."""
     client: Optional[BaseDeploymentClient] = Field(default=None, exclude=True)  #: :meta private:
 
     @property
@@ -253,6 +262,7 @@ class ChatDatabricks(BaseChatModel):
     def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)
         self.client = get_deployment_client(self.target_uri)
+        self.use_responses_api = kwargs.get("use_responses_api", False)
         self.extra_params = self.extra_params or {}
 
     @property
@@ -281,6 +291,11 @@ class ChatDatabricks(BaseChatModel):
     ) -> ChatResult:
         data = self._prepare_inputs(messages, stop, **kwargs)
         resp = self.client.predict(endpoint=self.model, inputs=data)  # type: ignore
+        if self.use_responses_api:
+            return self._convert_responses_api_response_to_chat_result(resp)
+        elif "messages" in resp:
+            return self._convert_chatagent_response_to_chat_result(resp)
+
         return self._convert_response_to_chat_result(resp)
 
     def _prepare_inputs(
@@ -290,11 +305,15 @@ class ChatDatabricks(BaseChatModel):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         data: Dict[str, Any] = {
-            "messages": [_convert_message_to_dict(msg) for msg in messages],
             "n": self.n,
             **self.extra_params,  # type: ignore
             **kwargs,
         }
+        if self.use_responses_api:
+            data["input"] = _convert_lc_messages_to_responses_api(messages)
+        else:
+            data["messages"] = [_convert_message_to_dict(msg) for msg in messages]
+
         if self.temperature is not None:
             data["temperature"] = self.temperature
         if stop := self.stop or stop:
@@ -303,6 +322,112 @@ class ChatDatabricks(BaseChatModel):
             data["max_tokens"] = self.max_tokens
 
         return data
+
+    def _convert_responses_api_response_to_chat_result(
+        self, response: Mapping[str, Any]
+    ) -> ChatResult:
+        """
+        A Responses API response has an array of messages, but a ChatResult can only have a single message.
+        To accomodate this, we combine the messages into a single message, following LangChain convention.
+        """
+        if response.get("error"):
+            raise ValueError(response.get("error"))
+        # Combine all content and tool calls from output items
+        content_blocks = []
+        tool_calls = []
+        invalid_tool_calls = []
+
+        for item in response.get("output", []):
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+
+            if item_type == "message":
+                for content in item.get("content", []):
+                    if content.get("type") == "output_text":
+                        content_blocks.append(
+                            {
+                                "type": "text",
+                                "text": content.get("text", ""),
+                                "annotations": content.get("annotations", []),
+                                "id": content.get("id", ""),
+                            }
+                        )
+                    elif content.get("type") == "refusal":
+                        content_blocks.append(
+                            {
+                                "type": "refusal",
+                                "refusal": content.get("refusal", ""),
+                                "id": content.get("id", ""),
+                            }
+                        )
+            elif item_type == "function_call":
+                content_blocks.append(item)
+                try:
+                    args = json.loads(item.get("arguments", ""), strict=False)
+                    error = None
+                except json.JSONDecodeError as e:
+                    error = str(e)
+                    args = item.get("arguments", "")
+                if error is None:
+                    tool_calls.append(
+                        {
+                            "type": "tool_call",
+                            "name": item.get("name", ""),
+                            "args": args,
+                            "id": item.get("call_id", ""),
+                        }
+                    )
+                else:
+                    invalid_tool_calls.append(
+                        {
+                            "type": "invalid_tool_call",
+                            "name": item.get("name", ""),
+                            "args": args,
+                            "id": item.get("call_id", ""),
+                            "error": error,
+                        }
+                    )
+            elif item_type == "function_call_output":
+                content_blocks.append(
+                    {
+                        "role": "tool",
+                        "content": item.get("output", ""),
+                        "tool_call_id": item.get("call_id", ""),
+                    }
+                )
+            elif item_type in (
+                "reasoning",
+                "web_search_call",
+                "file_search_call",
+                "computer_call",
+                "code_interpreter_call",
+                "mcp_call",
+                "mcp_list_tools",
+                "mcp_approval_request",
+                "image_generation_call",
+            ):
+                content_blocks.append(item)
+
+        # Create AI message with combined content and tool calls
+        message = AIMessage(
+            content=content_blocks,
+            tool_calls=tool_calls,
+            invalid_tool_calls=invalid_tool_calls,
+            id=response.get("id"),
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def _convert_chatagent_response_to_chat_result(self, response: Mapping[str, Any]) -> ChatResult:
+        """
+        A ChatAgent response has an array of messages, but a ChatResult can only have a single message.
+        To accomodate this, we combine the messages into a single message, following LangChain convention.
+
+        ex: https://github.com/langchain-ai/langchain/blob/2d3020f6cd9d3bf94738f2b6732b68acc55d9cce/libs/partners/openai/langchain_openai/chat_models/base.py#L3739
+        """
+        message = AIMessage(content=response.get("messages"), id=response.get("id"))
+        return ChatResult(generations=[ChatGeneration(message=message)])
 
     def _convert_response_to_chat_result(self, response: Mapping[str, Any]) -> ChatResult:
         generations = [
@@ -333,46 +458,63 @@ class ChatDatabricks(BaseChatModel):
             stream_usage = self.stream_usage
         data = self._prepare_inputs(messages, stop, **kwargs)
         first_chunk_role = None
-        for chunk in self.client.predict_stream(endpoint=self.model, inputs=data):  # type: ignore
-            if chunk["choices"]:
-                choice = chunk["choices"][0]
 
-                chunk_delta = choice["delta"]
-                if first_chunk_role is None:
-                    first_chunk_role = chunk_delta.get("role")
+        if self.use_responses_api:
+            prev_chunk = None
+            for chunk in self.client.predict_stream(endpoint=self.model, inputs=data):  # type: ignore
+                chunk_message = _convert_responses_api_chunk_to_lc_chunk(chunk, prev_chunk)
+                prev_chunk = chunk
+                if chunk_message:
+                    yield ChatGenerationChunk(message=chunk_message)
+        else:
+            for chunk in self.client.predict_stream(endpoint=self.model, inputs=data):  # type: ignore
+                # top level delta key means that it is a ChatAgentChunk
+                if chunk.get("delta"):
+                    chunk_delta = chunk["delta"]
+                    chunk_message = _convert_dict_to_message_chunk(
+                        chunk_delta, chunk_delta.get("role")
+                    )
+                    chunk = ChatGenerationChunk(message=chunk_message)
+                    yield chunk
+                elif chunk.get("choices"):
+                    choice = chunk["choices"][0]
 
-                if stream_usage and (usage := chunk.get("usage")):
-                    input_tokens = usage.get("prompt_tokens", 0)
-                    output_tokens = usage.get("completion_tokens", 0)
-                    usage = {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
-                    }
+                    chunk_delta = choice["delta"]
+                    if first_chunk_role is None:
+                        first_chunk_role = chunk_delta.get("role")
+
+                    if stream_usage and (usage := chunk.get("usage")):
+                        input_tokens = usage.get("prompt_tokens", 0)
+                        output_tokens = usage.get("completion_tokens", 0)
+                        usage = {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        }
+                    else:
+                        usage = None
+
+                    chunk_message = _convert_dict_to_message_chunk(
+                        chunk_delta, first_chunk_role, usage=usage
+                    )
+
+                    generation_info = {}
+                    if finish_reason := choice.get("finish_reason"):
+                        generation_info["finish_reason"] = finish_reason
+                    if logprobs := choice.get("logprobs"):
+                        generation_info["logprobs"] = logprobs
+
+                    chunk = ChatGenerationChunk(
+                        message=chunk_message, generation_info=generation_info or None
+                    )
+
+                    if run_manager:
+                        run_manager.on_llm_new_token(chunk.text, chunk=chunk, logprobs=logprobs)
+
+                    yield chunk
                 else:
-                    usage = None
-
-                chunk_message = _convert_dict_to_message_chunk(
-                    chunk_delta, first_chunk_role, usage=usage
-                )
-
-                generation_info = {}
-                if finish_reason := choice.get("finish_reason"):
-                    generation_info["finish_reason"] = finish_reason
-                if logprobs := choice.get("logprobs"):
-                    generation_info["logprobs"] = logprobs
-
-                chunk = ChatGenerationChunk(
-                    message=chunk_message, generation_info=generation_info or None
-                )
-
-                if run_manager:
-                    run_manager.on_llm_new_token(chunk.text, chunk=chunk, logprobs=logprobs)
-
-                yield chunk
-            else:
-                # Handle the case where choices are empty if needed
-                continue
+                    # Handle the case where choices are empty if needed
+                    continue
 
     def bind_tools(
         self,
@@ -740,6 +882,101 @@ def _convert_message_to_dict(message: BaseMessage) -> dict:
         raise ValueError(f"Got unknown message type: {type(message)}")
 
 
+def _convert_lc_messages_to_responses_api(messages: List[BaseMessage]) -> dict:
+    """
+    Convert a LangChain message to a Responses API message.
+    """
+    # TODO: add multimodal support
+    input_items = []
+    for lc_msg in messages:
+        cc_msg = _convert_message_to_dict(lc_msg)
+        # "name" parameter unsupported
+        if "name" in cc_msg:
+            cc_msg.pop("name")
+        role = cc_msg["role"]
+        if role == "assistant":
+            if isinstance(cc_msg.get("content"), list):
+                for block in cc_msg["content"]:
+                    if isinstance(block, dict) and (block_type := block.get("type")):
+                        if block_type in ("text", "output_text"):
+                            input_items.append(
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": block["text"],
+                                            "annotations": block.get("annotations") or [],
+                                        }
+                                    ],
+                                    "role": "assistant",
+                                    "id": lc_msg.id,
+                                }
+                            )
+                        elif block_type == "refusal":
+                            input_items.append(
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {
+                                            "type": "refusal",
+                                            "refusal": block["refusal"],
+                                        }
+                                    ],
+                                    "role": "assistant",
+                                    "id": lc_msg.id,
+                                }
+                            )
+                        elif block_type in (
+                            "reasoning",
+                            "web_search_call",
+                            "file_search_call",
+                            "function_call",
+                            "computer_call",
+                            "code_interpreter_call",
+                            "mcp_call",
+                            "mcp_list_tools",
+                            "mcp_approval_request",
+                        ):
+                            input_items.append(block | {"id": lc_msg.id})
+            elif isinstance(cc_msg.get("content"), str):
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": lc_msg.id,
+                        "content": [{"type": "output_text", "text": cc_msg["content"]}],
+                    }
+                )
+
+            if tool_calls := cc_msg.get("tool_calls"):
+                input_items.extend(
+                    [
+                        {
+                            "type": "function_call",
+                            "id": lc_msg.id,
+                            "call_id": tool_call["id"],
+                            "name": tool_call["function"]["name"],
+                            "arguments": tool_call["function"]["arguments"],
+                        }
+                        for tool_call in tool_calls
+                    ]
+                )
+        elif role == "tool":
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": cc_msg["tool_call_id"],
+                    "output": cc_msg["content"],
+                }
+            )
+        elif role in ("user", "system", "developer"):
+            input_items.append(cc_msg)
+        else:
+            pass
+    return input_items
+
+
 def _get_tool_calls_from_ai_message(message: AIMessage) -> List[Dict]:
     tool_calls = [
         {
@@ -788,6 +1025,10 @@ def _convert_dict_to_message(_dict: Dict) -> BaseMessage:
         return HumanMessage(content=content)
     elif role == "system":
         return SystemMessage(content=content)
+    elif role == "tool":
+        return ToolMessage(
+            content=content, tool_call_id=_dict.get("tool_call_id"), id=_dict.get("id")
+        )
     elif role == "assistant":
         additional_kwargs: Dict = {}
         tool_calls = []
@@ -854,3 +1095,92 @@ def _convert_dict_to_message_chunk(
         )
     else:
         return ChatMessageChunk(content=content, role=role)
+
+
+def _convert_responses_api_chunk_to_lc_chunk(
+    chunk: Mapping[str, Any], previous_chunk: Optional[Mapping[str, Any]] = None
+) -> BaseMessageChunk:
+    # TODO: add support for additional streaming types at another time
+    # ex. multimodal, tool calls, annotations, reasoning, refusal, etc.
+    content = []
+    tool_call_chunks = []
+    id = None
+    chunk_type = chunk.get("type")
+    if chunk_type == "response.output_text.delta":
+        id = chunk.get("item_id")
+        content.append(
+            {
+                "type": "text",
+                "text": chunk.get("delta", ""),
+            }
+        )
+    elif chunk_type == "response.output_item.done":
+        item = chunk.get("item")
+        item_type = item.get("type")
+        if item_type == "function_call_output":
+            id = item.get("call_id")
+            return ToolMessageChunk(
+                content=item.get("output"),
+                tool_call_id=item.get("call_id"),
+            )
+        elif item_type == "function_call":
+            id = item.get("call_id")
+            content.append(item)
+            tool_call_chunks.append(
+                tool_call_chunk(
+                    name=item.get("name"),
+                    args=item.get("arguments"),
+                    id=item.get("call_id"),
+                )
+            )
+        elif item_type == "message":
+            id = item.get("id")
+            # skip text outputs that have already been streamed, but keep the annotations
+            skip_duplicate_text = (
+                previous_chunk
+                and previous_chunk.get("type") == "response.output_text.delta"
+                and id == previous_chunk.get("item_id")
+            )
+            for content_item in item.get("content", []):
+                if content_item.get("type") == "output_text":
+                    if skip_duplicate_text:
+                        if content_item.get("annotations"):
+                            content.append({"annotations": content_item.get("annotations")})
+                    else:
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": content_item.get("text", ""),
+                                "annotations": content_item.get("annotations", []),
+                            }
+                        )
+                elif content_item.get("type") == "refusal":
+                    content.append(
+                        {
+                            "type": "refusal",
+                            "refusal": content_item.get("refusal", ""),
+                        }
+                    )
+        elif item_type in (
+            "web_search_call",
+            "file_search_call",
+            "computer_call",
+            "code_interpreter_call",
+            "mcp_call",
+            "mcp_list_tools",
+            "mcp_approval_request",
+            "image_generation_call",
+            "reasoning",
+        ):
+            content.append(item)
+    elif chunk_type == "error":
+        raise ValueError(str(chunk))
+    else:
+        return None
+
+    if content:
+        return AIMessageChunk(
+            content=content,
+            tool_call_chunks=tool_call_chunks,
+            id=id,
+        )
