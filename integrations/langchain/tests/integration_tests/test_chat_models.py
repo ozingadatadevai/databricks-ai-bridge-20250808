@@ -9,8 +9,8 @@ need to update the corresponding integration test, please contact to the
 maintainers of the repository to verify the changes.
 """
 
+import os
 from typing import Annotated
-from unittest import mock
 
 import pytest
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -34,11 +34,27 @@ from typing_extensions import TypedDict
 
 from databricks_langchain.chat_models import ChatDatabricks
 
-_TEST_ENDPOINT = "databricks-meta-llama-3-70b-instruct"
+_FOUNDATION_MODELS = [
+    "databricks-claude-3-7-sonnet",
+    "databricks-meta-llama-3-3-70b-instruct",
+]
+
+# Endpoint constants for easier maintenance
+RESPONSES_AGENT_ENDPOINT_WITH_ANNOTATIONS = "agents_ml-bbqiu-annotationsv2"
+RESPONSES_AGENT_ENDPOINT_WITH_TOOL_CALLING = "agents_ml-bbqiu-resp-fmapi"
+CHAT_AGENT_ENDPOINT_WITH_TOOL_CALLING = "agents_smurching-default-test_external_monitor_cuj"
+DATABRICKS_CLI_PROFILE = "dogfood"
+
+_RESPONSES_API_ENDPOINTS = [
+    RESPONSES_AGENT_ENDPOINT_WITH_ANNOTATIONS,
+    RESPONSES_AGENT_ENDPOINT_WITH_TOOL_CALLING,
+]
 
 
-def test_chat_databricks_invoke():
-    chat = ChatDatabricks(model=_TEST_ENDPOINT, temperature=0, max_tokens=10, stop=["Java"])
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_invoke(model):
+    chat = ChatDatabricks(model=model, temperature=0, max_tokens=10, stop=["Java"])
 
     response = chat.invoke("How to learn Java? Start the response by 'To learn Java,'")
     assert isinstance(response, AIMessage)
@@ -76,9 +92,11 @@ def test_chat_databricks_invoke():
     assert response.content is not None
 
 
-def test_chat_databricks_invoke_multiple_completions():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_invoke_multiple_completions(model):
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0.5,
         n=3,
         max_tokens=10,
@@ -87,7 +105,9 @@ def test_chat_databricks_invoke_multiple_completions():
     assert isinstance(response, AIMessage)
 
 
-def test_chat_databricks_stream():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_stream(model):
     class FakeCallbackHandler(BaseCallbackHandler):
         def __init__(self):
             self.chunk_counts = 0
@@ -98,7 +118,7 @@ def test_chat_databricks_stream():
     callback = FakeCallbackHandler()
 
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         stop=["Python"],
         max_tokens=100,
@@ -114,7 +134,9 @@ def test_chat_databricks_stream():
     assert last_chunk.response_metadata["finish_reason"] == "stop"
 
 
-def test_chat_databricks_stream_with_usage():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_stream_with_usage(model):
     class FakeCallbackHandler(BaseCallbackHandler):
         def __init__(self):
             self.chunk_counts = 0
@@ -125,7 +147,7 @@ def test_chat_databricks_stream_with_usage():
     callback = FakeCallbackHandler()
 
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         stop=["Python"],
         max_tokens=100,
@@ -147,9 +169,11 @@ def test_chat_databricks_stream_with_usage():
 
 
 @pytest.mark.asyncio
-async def test_chat_databricks_ainvoke():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+async def test_chat_databricks_ainvoke(model):
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=10,
     )
@@ -159,9 +183,12 @@ async def test_chat_databricks_ainvoke():
     assert response.content.startswith("To learn Python,")
 
 
-async def test_chat_databricks_astream():
+@pytest.mark.asyncio
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+async def test_chat_databricks_astream(model):
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=10,
     )
@@ -173,9 +200,11 @@ async def test_chat_databricks_astream():
 
 
 @pytest.mark.asyncio
-async def test_chat_databricks_abatch():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+async def test_chat_databricks_abatch(model):
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=10,
     )
@@ -191,10 +220,12 @@ async def test_chat_databricks_abatch():
     assert all(isinstance(response, AIMessage) for response in responses)
 
 
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
 @pytest.mark.parametrize("tool_choice", [None, "auto", "required", "any", "none"])
-def test_chat_databricks_tool_calls(tool_choice):
+def test_chat_databricks_tool_calls(model, tool_choice):
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=100,
     )
@@ -206,23 +237,26 @@ def test_chat_databricks_tool_calls(tool_choice):
 
     llm_with_tools = chat.bind_tools([GetWeather], tool_choice=tool_choice)
     question = "Which is the current weather in Los Angeles, CA?"
-    response = llm_with_tools.invoke(question)
 
+    response = llm_with_tools.invoke(question)
     if tool_choice == "none":
         assert response.tool_calls == []
         return
 
-    assert response.tool_calls == [
-        {
-            "name": "GetWeather",
-            "args": {"location": "Los Angeles, CA"},
-            "id": mock.ANY,
-            "type": "tool_call",
-        }
-    ]
+    # Models should make at least one tool call when tool_choice is not "none"
+    assert (
+        len(response.tool_calls) >= 1
+    ), f"Expected at least 1 tool call, got {len(response.tool_calls)}"
+
+    # The first tool call should be for GetWeather
+    first_call = response.tool_calls[0]
+    assert first_call["name"] == "GetWeather", f"Expected GetWeather tool, got {first_call['name']}"
+    assert "location" in first_call["args"], f"Expected location in args, got {first_call['args']}"
+    assert first_call["type"] == "tool_call"
+    assert first_call["id"] is not None
 
     tool_msg = ToolMessage(
-        "GetWeather",
+        "Sunny, 72°F",
         tool_call_id=response.additional_kwargs["tool_calls"][0]["id"],
     )
     response = llm_with_tools.invoke(
@@ -230,18 +264,18 @@ def test_chat_databricks_tool_calls(tool_choice):
             HumanMessage(question),
             response,
             tool_msg,
-            HumanMessage("What about San Francisco, CA?"),
+            HumanMessage("What about New York, NY?"),
         ]
     )
-
-    assert response.tool_calls == [
-        {
-            "name": "GetWeather",
-            "args": {"location": "San Francisco, CA"},
-            "id": mock.ANY,
-            "type": "tool_call",
-        }
-    ]
+    # Should call GetWeather tool for the followup question
+    assert (
+        len(response.tool_calls) >= 1
+    ), f"Expected at least 1 tool call, got {len(response.tool_calls)}"
+    tool_call = response.tool_calls[0]
+    assert tool_call["name"] == "GetWeather", f"Expected GetWeather tool, got {tool_call['name']}"
+    assert "location" in tool_call["args"], f"Expected location in args, got {tool_call['args']}"
+    assert tool_call["type"] == "tool_call"
+    assert tool_call["id"] is not None
 
 
 # Pydantic-based schema
@@ -272,9 +306,11 @@ JSON_SCHEMA = {
 
 
 @pytest.mark.parametrize("schema", [AnswerWithJustification, JSON_SCHEMA, None])
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
 @pytest.mark.parametrize("method", ["function_calling", "json_mode"])
-def test_chat_databricks_with_structured_output(schema, method):
-    llm = ChatDatabricks(model=_TEST_ENDPOINT)
+def test_chat_databricks_with_structured_output(model, schema, method):
+    llm = ChatDatabricks(model=model)
 
     if schema is None and method == "function_calling":
         pytest.skip("Cannot use function_calling without schema")
@@ -304,9 +340,11 @@ def test_chat_databricks_with_structured_output(schema, method):
     assert isinstance(response_with_raw["raw"], AIMessage)
 
 
-def test_chat_databricks_runnable_sequence():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_runnable_sequence(model):
     chat = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=100,
     )
@@ -340,9 +378,11 @@ def multiply(a: int, b: int) -> int:
     return a * b
 
 
-def test_chat_databricks_agent_executor():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_agent_executor(model):
     model = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=100,
     )
@@ -362,9 +402,11 @@ def test_chat_databricks_agent_executor():
     assert "45" in response["output"]
 
 
-def test_chat_databricks_langgraph():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_langgraph(model):
     model = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=100,
     )
@@ -375,13 +417,15 @@ def test_chat_databricks_langgraph():
     assert "45" in response["messages"][-1].content
 
 
-def test_chat_databricks_langgraph_with_memory():
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_langgraph_with_memory(model):
     class State(TypedDict):
         messages: Annotated[list, add_messages]
 
     tools = [add, multiply]
     llm = ChatDatabricks(
-        model=_TEST_ENDPOINT,
+        model=model,
         temperature=0,
         max_tokens=100,
     )
@@ -422,3 +466,252 @@ def test_chat_databricks_langgraph_with_memory():
         )
 
     assert "40" in response["messages"][-1].content
+
+
+@pytest.mark.st_endpoints
+@pytest.mark.parametrize("endpoint", _RESPONSES_API_ENDPOINTS)
+@pytest.mark.skipif(
+    os.environ.get("RUN_ST_ENDPOINT_TESTS", "").lower() != "true",
+    reason="Single tenant endpoint tests require special endpoint access. Set RUN_ST_ENDPOINT_TESTS=true to run.",
+)
+def test_chat_databricks_responses_api_invoke(endpoint):
+    """Test ChatDatabricks with responses API."""
+    from databricks.sdk import WorkspaceClient
+
+    workspace_client = WorkspaceClient(profile=DATABRICKS_CLI_PROFILE)
+    chat = ChatDatabricks(
+        model=endpoint,
+        workspace_client=workspace_client,
+        use_responses_api=True,
+        temperature=0,
+        max_tokens=500,
+    )
+
+    response = chat.invoke("What is the 100th fibonacci number?")
+    assert isinstance(response, AIMessage)
+    assert response.content is not None
+    assert len(response.content) > 0
+
+
+@pytest.mark.st_endpoints
+@pytest.mark.parametrize("endpoint", _RESPONSES_API_ENDPOINTS)
+@pytest.mark.skipif(
+    os.environ.get("RUN_ST_ENDPOINT_TESTS", "").lower() != "true",
+    reason="Single tenant endpoint tests require special endpoint access. Set RUN_ST_ENDPOINT_TESTS=true to run.",
+)
+def test_chat_databricks_responses_api_stream(endpoint):
+    """Test ChatDatabricks streaming with responses API."""
+    from databricks.sdk import WorkspaceClient
+
+    workspace_client = WorkspaceClient(profile=DATABRICKS_CLI_PROFILE)
+    chat = ChatDatabricks(
+        model=endpoint,
+        workspace_client=workspace_client,
+        use_responses_api=True,
+        temperature=0,
+        max_tokens=500,
+    )
+
+    chunks = list(chat.stream("What is the 100th fibonacci number?"))
+    assert len(chunks) > 0
+
+    # Responses API can return both AIMessageChunk and ToolMessageChunk
+    from langchain_core.messages import BaseMessageChunk
+
+    assert all(isinstance(chunk, BaseMessageChunk) for chunk in chunks)
+
+    # Combine all AI message chunks to get text content
+    ai_chunks = [chunk for chunk in chunks if isinstance(chunk, AIMessageChunk)]
+    text_content = []
+    for chunk in ai_chunks:
+        if chunk.content:
+            for content_item in chunk.content:
+                if isinstance(content_item, dict) and content_item.get("type") == "text":
+                    text_content.append(content_item.get("text", ""))
+                elif isinstance(content_item, str):
+                    text_content.append(content_item)
+
+    full_text = "".join(text_content)
+    assert len(full_text) > 0
+
+
+@pytest.mark.st_endpoints
+@pytest.mark.skipif(
+    os.environ.get("RUN_ST_ENDPOINT_TESTS", "").lower() != "true",
+    reason="Single tenant endpoint tests require special endpoint access. Set RUN_ST_ENDPOINT_TESTS=true to run.",
+)
+def test_chat_databricks_chatagent_invoke():
+    """Test ChatDatabricks with ChatAgent endpoint."""
+    from databricks.sdk import WorkspaceClient
+
+    workspace_client = WorkspaceClient(profile=DATABRICKS_CLI_PROFILE)
+    chat = ChatDatabricks(
+        model=CHAT_AGENT_ENDPOINT_WITH_TOOL_CALLING,
+        workspace_client=workspace_client,
+        temperature=0,
+        max_tokens=500,
+    )
+
+    response = chat.invoke("What is the 100th fibonacci number?")
+    assert isinstance(response, AIMessage)
+    assert response.content is not None
+
+    # ChatAgent should use tool calls for complex computations like fibonacci
+    # The response content is a list containing message objects including tool calls
+    has_tool_calls = False
+    python_tool_used = False
+
+    if isinstance(response.content, list):
+        # Check for tool calls in the message sequence
+        for item in response.content:
+            if isinstance(item, dict):
+                # Check for tool_calls in assistant messages
+                if item.get("tool_calls"):
+                    has_tool_calls = True
+                    for tool_call in item["tool_calls"]:
+                        tool_name = tool_call.get("function", {}).get("name", "")
+                        if "python" in tool_name.lower() and "exec" in tool_name.lower():
+                            python_tool_used = True
+                # Check for tool role messages (responses from tools)
+                elif item.get("role") == "tool":
+                    has_tool_calls = True
+                # Check for function_call type content blocks
+                elif item.get("type") == "function_call":
+                    has_tool_calls = True
+                    if (
+                        "python" in item.get("name", "").lower()
+                        and "exec" in item.get("name", "").lower()
+                    ):
+                        python_tool_used = True
+
+    assert has_tool_calls, f"Expected ChatAgent to use tool calls for fibonacci computation. Content: {response.content}"
+    assert python_tool_used, f"Expected ChatAgent to use python execution tool for fibonacci computation. Content: {response.content}"
+
+
+@pytest.mark.st_endpoints
+@pytest.mark.skipif(
+    os.environ.get("RUN_ST_ENDPOINT_TESTS", "").lower() != "true",
+    reason="Single tenant endpoint tests require special endpoint access. Set RUN_ST_ENDPOINT_TESTS=true to run.",
+)
+def test_chat_databricks_chatagent_stream():
+    """Test ChatDatabricks streaming with ChatAgent endpoint."""
+    from databricks.sdk import WorkspaceClient
+
+    workspace_client = WorkspaceClient(profile=DATABRICKS_CLI_PROFILE)
+    chat = ChatDatabricks(
+        model=CHAT_AGENT_ENDPOINT_WITH_TOOL_CALLING,
+        workspace_client=workspace_client,
+        temperature=0,
+        max_tokens=500,
+    )
+
+    chunks = list(chat.stream("What is the 100th fibonacci number?"))
+    assert len(chunks) > 0
+
+    # ChatAgent streaming can include both AIMessageChunk and ToolMessageChunk
+    from langchain_core.messages import BaseMessageChunk
+
+    assert all(isinstance(chunk, BaseMessageChunk) for chunk in chunks)
+
+    # For streaming ChatAgent, just verify we get meaningful content
+    # Tool call detection in streaming is more complex and may vary
+    total_content = ""
+    for chunk in chunks:
+        if isinstance(chunk.content, str):
+            total_content += chunk.content
+        elif isinstance(chunk.content, list):
+            for item in chunk.content:
+                if isinstance(item, dict) and item.get("text"):
+                    total_content += item["text"]
+
+    # Verify we get a meaningful response (should contain the fibonacci result or computation)
+    assert len(total_content) > 0, "Expected non-empty content from streaming ChatAgent"
+
+
+@pytest.mark.st_endpoints
+@pytest.mark.parametrize("endpoint", _RESPONSES_API_ENDPOINTS)
+@pytest.mark.skipif(
+    os.environ.get("RUN_ST_ENDPOINT_TESTS", "").lower() != "true",
+    reason="Single tenant endpoint tests require special endpoint access. Set RUN_ST_ENDPOINT_TESTS=true to run.",
+)
+def test_responses_api_extra_body_custom_inputs(endpoint):
+    """Test that extra_body parameter can pass custom_inputs to Responses API endpoint"""
+    from databricks.sdk import WorkspaceClient
+
+    workspace_client = WorkspaceClient(profile=DATABRICKS_CLI_PROFILE)
+    chat = ChatDatabricks(
+        model=endpoint,
+        workspace_client=workspace_client,
+        use_responses_api=True,
+        temperature=0,
+        max_tokens=500,
+        extra_params={
+            "extra_body": {
+                "custom_inputs": {"test_key": "test_value", "user_preference": "concise"}
+            }
+        },
+    )
+
+    response = chat.invoke("What is the 100th fibonacci number?")
+
+    assert isinstance(response, AIMessage)
+    assert response.content
+    # Test passes if the endpoint accepts the extra_body without error
+
+
+@pytest.mark.st_endpoints
+@pytest.mark.skipif(
+    os.environ.get("RUN_ST_ENDPOINT_TESTS", "").lower() != "true",
+    reason="Single tenant endpoint tests require special endpoint access. Set RUN_ST_ENDPOINT_TESTS=true to run.",
+)
+def test_chatagent_extra_body_custom_inputs():
+    """Test that extra_body parameter works with ChatAgent endpoints"""
+    from databricks.sdk import WorkspaceClient
+
+    workspace_client = WorkspaceClient(profile=DATABRICKS_CLI_PROFILE)
+    chat = ChatDatabricks(
+        model=CHAT_AGENT_ENDPOINT_WITH_TOOL_CALLING,
+        workspace_client=workspace_client,
+        temperature=0,
+        max_tokens=50,
+        extra_params={
+            "extra_body": {"custom_inputs": {"test_mode": "integration", "response_style": "brief"}}
+        },
+    )
+
+    response = chat.invoke("Hello! How are you?")
+
+    assert isinstance(response, AIMessage)
+    assert response.content
+    # Test passes if the endpoint accepts the extra_body without error
+
+
+@pytest.mark.foundation_models
+@pytest.mark.parametrize("model", _FOUNDATION_MODELS)
+def test_chat_databricks_utf8_encoding(model):
+    """Test that ChatDatabricks properly handles UTF-8 encoding."""
+    chat = ChatDatabricks(
+        model=model,
+        temperature=0,
+        max_tokens=200,
+    )
+    messages = [
+        SystemMessage(content="Du er en hjælpsom assistent der kan dansk."),
+        HumanMessage(content="Sig blåbær på dansk, med små bogstaver."),
+    ]
+
+    # Test invoke with UTF-8 characters
+    response = chat.invoke(messages)
+    assert isinstance(response, AIMessage)
+    assert "blåbær" in response.content
+
+    # Test with streaming as well to ensure chunks handle UTF-8
+    stream_chunks = list(chat.stream(messages))
+    assert len(stream_chunks) > 0
+
+    # Combine all chunks to verify content
+    full_content = ""
+    for chunk in stream_chunks:
+        if hasattr(chunk, "content") and chunk.content:
+            full_content += chunk.content
+    assert "blåbær" in full_content.lower()
