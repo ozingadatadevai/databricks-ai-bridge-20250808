@@ -4,7 +4,8 @@ import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Union
+from typing import Optional, Union, Any
+from functools import partial
 
 import mlflow
 import pandas as pd
@@ -21,15 +22,26 @@ def _count_tokens(text):
     return len(encoding.encode(text))
 
 
+# Define a function for converting a dataframe to JSON
+def _to_json_string(data: pd.DataFrame, kwargs: Optional[dict[str, Any]]) -> str:
+    if data.empty:
+        return ""
+    return data.to_json(**kwargs)
+
+def _to_markdown_string(data: pd.DataFrame) -> str:
+    return data.to_markdown()
+
+
 @dataclass
 class GenieResponse:
     result: Union[str, pd.DataFrame]
     query: Optional[str] = ""
     description: Optional[str] = ""
+    conversation_id: Optional[str] = None
 
 
 @mlflow.trace(span_type="PARSER")
-def _parse_query_result(resp, truncate_results) -> Union[str, pd.DataFrame]:
+def _parse_query_result(resp, truncate_results, result_as_json: bool = False, json_kwargs: Optional[dict[str, Any]] = None) -> Union[str, pd.DataFrame]:
     output = resp["result"]
     if not output:
         return "EMPTY"
@@ -61,8 +73,10 @@ def _parse_query_result(resp, truncate_results) -> Union[str, pd.DataFrame]:
 
         rows.append(row)
 
+    string_formatter = partial(_to_json_string, json_kwargs=json_kwargs) if result_as_json else _to_markdown_string
+
     dataframe = pd.DataFrame(rows, columns=header)
-    query_result = dataframe.to_markdown()
+    query_result = string_formatter(dataframe)
     tokens_used = _count_tokens(query_result)
 
     # If the full result fits, return it
@@ -70,7 +84,7 @@ def _parse_query_result(resp, truncate_results) -> Union[str, pd.DataFrame]:
         return query_result.strip()
 
     def is_too_big(n):
-        return _count_tokens(dataframe.iloc[:n].to_markdown()) > MAX_TOKENS_OF_DATA
+        return _count_tokens(string_formatter(dataframe.iloc[:n])) > MAX_TOKENS_OF_DATA
 
     # Use bisect_left to find the cutoff point of rows within the max token data limit in a O(log n) complexity
     # Passing True, as this is the target value we are looking for when _is_too_big returns
@@ -83,11 +97,11 @@ def _parse_query_result(resp, truncate_results) -> Union[str, pd.DataFrame]:
     if len(truncated_df) == 0:
         return ""
 
-    truncated_result = truncated_df.to_markdown()
+    truncated_result = string_formatter(truncated_df)
 
     # Double-check edge case if we overshot by one
     if _count_tokens(truncated_result) > MAX_TOKENS_OF_DATA:
-        truncated_result = truncated_df.iloc[:-1].to_markdown()
+        truncated_result = string_formatter(truncated_df.iloc[:-1])
 
     if not truncate_results:
         warnings.warn(
@@ -134,7 +148,7 @@ class Genie:
         return resp
 
     @mlflow.trace()
-    def poll_for_result(self, conversation_id, message_id):
+    def poll_for_result(self, conversation_id, message_id, result_as_json: bool = False, json_kwargs: Optional[dict[str, Any]] = None):
         @mlflow.trace()
         def poll_query_results(attachment_id, query_str, description):
             iteration_count = 0
@@ -147,19 +161,20 @@ class Genie:
                 )["statement_response"]
                 state = resp["status"]["state"]
                 if state == "SUCCEEDED":
-                    result = _parse_query_result(resp, self.truncate_results)
-                    return GenieResponse(result, query_str, description)
+                    result = _parse_query_result(resp, self.truncate_results, result_as_json, json_kwargs)
+                    return GenieResponse(result, query_str, description, conversation_id)
                 elif state in ["RUNNING", "PENDING"]:
                     logging.debug("Waiting for query result...")
                     time.sleep(5)
                 else:
                     return GenieResponse(
-                        f"No query result: {resp['state']}", query_str, description
+                        f"No query result: {resp['state']}", query_str, description, conversation_id=conversation_id
                     )
             return GenieResponse(
                 f"Genie query for result timed out after {MAX_ITERATIONS} iterations of 5 seconds",
                 query_str,
                 description,
+                conversation_id=conversation_id
             )
 
         @mlflow.trace()
@@ -189,19 +204,35 @@ class Genie:
                     return GenieResponse(result=f"Genie query {resp['status'].lower()}.")
                 elif resp["status"] == "FAILED":
                     return GenieResponse(
-                        result=f"Genie query failed with error: {resp.get('error', 'Unknown error')}"
+                        result=f"Genie query failed with error: {resp.get('error', 'Unknown error')}",
+                        conversation_id=conversation_id
                     )
                 # includes EXECUTING_QUERY, Genie can retry after this status
                 else:
                     logging.debug(f"Waiting...: {resp['status']}")
                     time.sleep(5)
             return GenieResponse(
-                f"Genie query timed out after {MAX_ITERATIONS} iterations of 5 seconds"
+                f"Genie query timed out after {MAX_ITERATIONS} iterations of 5 seconds",
+                conversation_id=conversation_id
             )
 
         return poll_result()
 
     @mlflow.trace()
-    def ask_question(self, question):
-        resp = self.start_conversation(question)
-        return self.poll_for_result(resp["conversation_id"], resp["message_id"])
+    def ask_question(self, question, conversation_id: Optional[str] = None, *, result_as_json: bool = False, json_kwargs: Optional[dict[str, Any]] = None):
+        # check if a conversation_id is supplied
+        # if yes, continue an existing genie conversation
+        # otherwise start a new conversation
+        if not conversation_id:
+            resp = self.start_conversation(question)
+        else:
+            resp = self.create_message(conversation_id, question)
+
+        conversation_id = resp.get("conversation_id")
+        message_id = resp.get("message_id")
+        genie_response = self.poll_for_result(conversation_id, message_id, result_as_json=result_as_json, json_kwargs=json_kwargs)
+
+        if not genie_response.conversation_id:
+            genie_response.conversation_id = conversation_id
+
+        return genie_response
