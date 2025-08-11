@@ -4,8 +4,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Union, Any
-from functools import partial
+from typing import Optional, Union, Any, Literal
 
 import mlflow
 import pandas as pd
@@ -22,14 +21,16 @@ def _count_tokens(text):
     return len(encoding.encode(text))
 
 
-# Define a function for converting a dataframe to JSON
-def _to_json_string(data: pd.DataFrame, kwargs: Optional[dict[str, Any]]) -> str:
-    if data.empty:
-        return ""
-    return data.to_json(**kwargs)
+@mlflow.trace(span_type="PARSER")
+def _to_markdown_string(df: pd.DataFrame, formatter_kwargs: Optional[dict[str, Any]] = None) -> str:
+    kwargs = (formatter_kwargs or {})
+    return "" if df.empty else df.to_markdown(**kwargs)
 
-def _to_markdown_string(data: pd.DataFrame) -> str:
-    return data.to_markdown()
+
+@mlflow.trace(span_type="PARSER")
+def _to_json_string(df: pd.DataFrame, formatter_kwargs: Optional[dict[str, Any]]) -> str:
+    kwargs = {"orient": "records"} | (formatter_kwargs or {})
+    return "" if df.empty else df.to_json(**kwargs)
 
 
 @dataclass
@@ -41,7 +42,7 @@ class GenieResponse:
 
 
 @mlflow.trace(span_type="PARSER")
-def _parse_query_result(resp, truncate_results, result_as_json: bool = False, json_kwargs: Optional[dict[str, Any]] = None) -> Union[str, pd.DataFrame]:
+def _parse_query_result(resp, truncate_results, result_format: Literal['MARKDOWN', 'JSON'] = 'MARKDOWN', formatter_kwargs: Optional[dict[str, Any]] = None) -> Union[str, pd.DataFrame]:
     output = resp["result"]
     if not output:
         return "EMPTY"
@@ -73,10 +74,18 @@ def _parse_query_result(resp, truncate_results, result_as_json: bool = False, js
 
         rows.append(row)
 
-    string_formatter = partial(_to_json_string, json_kwargs=json_kwargs) if result_as_json else _to_markdown_string
+    def _get_formatter_function(format_name: str):
+        if format_name == "JSON":
+            return _to_json_string
+        elif format_name == "MARKDOWN":
+            return _to_markdown_string
+        else:
+            return _to_markdown_string
+
+    string_formatter = _get_formatter_function(result_format)
 
     dataframe = pd.DataFrame(rows, columns=header)
-    query_result = string_formatter(dataframe)
+    query_result = string_formatter(dataframe, formatter_kwargs)
     tokens_used = _count_tokens(query_result)
 
     # If the full result fits, return it
@@ -84,7 +93,7 @@ def _parse_query_result(resp, truncate_results, result_as_json: bool = False, js
         return query_result.strip()
 
     def is_too_big(n):
-        return _count_tokens(string_formatter(dataframe.iloc[:n])) > MAX_TOKENS_OF_DATA
+        return _count_tokens(string_formatter(dataframe.iloc[:n], formatter_kwargs)) > MAX_TOKENS_OF_DATA
 
     # Use bisect_left to find the cutoff point of rows within the max token data limit in a O(log n) complexity
     # Passing True, as this is the target value we are looking for when _is_too_big returns
@@ -97,11 +106,11 @@ def _parse_query_result(resp, truncate_results, result_as_json: bool = False, js
     if len(truncated_df) == 0:
         return ""
 
-    truncated_result = string_formatter(truncated_df)
+    truncated_result = string_formatter(truncated_df, formatter_kwargs)
 
     # Double-check edge case if we overshot by one
     if _count_tokens(truncated_result) > MAX_TOKENS_OF_DATA:
-        truncated_result = string_formatter(truncated_df.iloc[:-1])
+        truncated_result = string_formatter(truncated_df.iloc[:-1], formatter_kwargs)
 
     if not truncate_results:
         warnings.warn(
@@ -148,7 +157,7 @@ class Genie:
         return resp
 
     @mlflow.trace()
-    def poll_for_result(self, conversation_id, message_id, result_as_json: bool = False, json_kwargs: Optional[dict[str, Any]] = None):
+    def poll_for_result(self, conversation_id, message_id, result_format: Literal['MARKDOWN', 'JSON'] = 'MARKDOWN', formatter_kwargs: Optional[dict[str, Any]] = None):
         @mlflow.trace()
         def poll_query_results(attachment_id, query_str, description):
             iteration_count = 0
@@ -161,7 +170,7 @@ class Genie:
                 )["statement_response"]
                 state = resp["status"]["state"]
                 if state == "SUCCEEDED":
-                    result = _parse_query_result(resp, self.truncate_results, result_as_json, json_kwargs)
+                    result = _parse_query_result(resp, self.truncate_results, result_format, formatter_kwargs)
                     return GenieResponse(result, query_str, description, conversation_id)
                 elif state in ["RUNNING", "PENDING"]:
                     logging.debug("Waiting for query result...")
@@ -219,7 +228,7 @@ class Genie:
         return poll_result()
 
     @mlflow.trace()
-    def ask_question(self, question, conversation_id: Optional[str] = None, *, result_as_json: bool = False, json_kwargs: Optional[dict[str, Any]] = None):
+    def ask_question(self, question, conversation_id: Optional[str] = None, *, result_format: Literal['MARKDOWN', 'JSON'] = 'MARKDOWN', formatter_kwargs: Optional[dict[str, Any]] = None):
         # check if a conversation_id is supplied
         # if yes, continue an existing genie conversation
         # otherwise start a new conversation
@@ -230,7 +239,7 @@ class Genie:
 
         conversation_id = resp.get("conversation_id")
         message_id = resp.get("message_id")
-        genie_response = self.poll_for_result(conversation_id, message_id, result_as_json=result_as_json, json_kwargs=json_kwargs)
+        genie_response = self.poll_for_result(conversation_id, message_id, result_format=result_format, formatter_kwargs=formatter_kwargs)
 
         if not genie_response.conversation_id:
             genie_response.conversation_id = conversation_id
