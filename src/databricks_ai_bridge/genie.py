@@ -29,7 +29,7 @@ def _to_markdown_string(df: pd.DataFrame, formatter_kwargs: Optional[dict[str, A
 
 @mlflow.trace(span_type="PARSER")
 def _to_json_string(df: pd.DataFrame, formatter_kwargs: Optional[dict[str, Any]]) -> str:
-    kwargs = {"orient": "records"} | (formatter_kwargs or {})
+    kwargs = {"orient": "records", "date_format": "iso"} | (formatter_kwargs or {})
     return "" if df.empty else df.to_json(**kwargs)
 
 
